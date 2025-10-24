@@ -1,0 +1,102 @@
+## snowpark-setup
+
+---create file format
+create or replace file format csv_format
+TYPE ='CSV'
+SKIP_HEADER = 1
+FIELD_OPTIONALLY_ENCLOSED_BY = '"';
+
+
+-- Create Storage Integration
+CREATE OR REPLACE STORAGE INTEGRATION s3_integration
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::919490798061:role/Snowpark-poc'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://snowparkingestion/source/');
+
+DESC INTEGRATION s3_integration
+
+
+--External storage in snowflake
+
+CREATE OR REPLACE STAGE s3_stage
+  STORAGE_INTEGRATION = s3_integration
+  URL = 's3://snowparkingestion/source/'
+  FILE_FORMAT = (TYPE = 'CSV' FIELD_DELIMITER = ',' SKIP_HEADER = 1);
+  -- Adjust FILE_FORMAT based on your file type (CSV, JSON, PARQUET, etc.)
+
+LIST @s3_stage;
+--landing_stage_path = "@my_s3_stage/customer_details/*.csv"
+
+  CREATE OR REPLACE STAGE MY_S3_STAGE
+  URL='s3://snowparkingestion/source/'
+  STORAGE_INTEGRATION = S3_INTEGRATION
+  FILE_FORMAT = (TYPE = 'CSV' FIELD_DELIMITER = ',' SKIP_HEADER = 1);
+--  
+--s3://snowparkingestion/source/customer_details.csv
+
+LIST @MY_S3_STAGE;
+
+DESC INTEGRATION S3_INTEGRATION;
+LIST @MY_S3_STAGE/;
+
+LIST @MY_S3_STAGE ;
+
+
+## DDL for Config_table, DQ_ERROR_LOG & QUARANTINE_DQ
+
+CREATE OR REPLACE TABLE CONFIGURATION_MASTER (
+    configuration_id   NUMBER AUTOINCREMENT START 1 INCREMENT 1 NOT NULL,
+    source_system      STRING,                
+    source_object_name STRING,                
+    bronze_table       STRING,                
+    silver_table       STRING,                
+    unified_table      STRING,                
+    frequency          STRING,                
+    landing_path       STRING,                
+    archive_path       STRING,                
+    file_format        STRING,                
+    delimiter          STRING DEFAULT ',',    
+    header             BOOLEAN DEFAULT TRUE,  
+    primary_key        STRING,                
+    active_flag        BOOLEAN DEFAULT TRUE,  
+    created_ts         TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+    updated_ts         TIMESTAMP_LTZ,
+    CONSTRAINT PK_CONFIGURATION_MASTER PRIMARY KEY (configuration_id)
+);
+
+================================================================================================
+
+CREATE OR REPLACE TABLE SNOWFLAKE_LEARNING_DB.PUBLIC.DQ_ERROR_LOG (
+    RUN_ID VARCHAR(16777216),
+    RUN_TIMESTAMP TIMESTAMP_NTZ(9),
+    LAYER VARCHAR(16777216),
+    SOURCE_OBJECT VARCHAR(16777216),
+    TABLE_NAME VARCHAR(16777216),
+    CHECK_TYPE VARCHAR(16777216),
+    CHECK_COLUMN VARCHAR(16777216),
+    TOTAL_RECORDS NUMBER(38,0),
+    FAILED_RECORDS NUMBER(38,0),
+    PASS_PERCENTAGE NUMBER(5,2),
+    STATUS VARCHAR(16777216),
+    MESSAGE VARCHAR(16777216)
+);
+
+
+====================================================================================================
+
+CREATE OR REPLACE TABLE SNOWFLAKE_LEARNING_DB.PUBLIC.QUARANTINE_DQ (
+    -- Metadata columns
+    QUARANTINE_ID NUMBER AUTOINCREMENT START 1 INCREMENT 1 COMMENT 'Unique identifier for quarantined record',
+    QUARANTINE_TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() COMMENT 'Timestamp when record was quarantined',
+    SOURCE_OBJECT VARCHAR(255) COMMENT 'Source object/file name',
+    DQ_FAILURE_REASON VARCHAR(1000) COMMENT 'Comma-separated list of DQ validation failures',
+    -- Audit columns
+    CREATED_BY VARCHAR(100) DEFAULT CURRENT_USER() COMMENT 'User who created the record',
+    CREATED_DATE TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() COMMENT 'Record creation timestamp'
+)
+COMMENT = 'Quarantine table for records failing data quality validation checks';
+
+
+  
