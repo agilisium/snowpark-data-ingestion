@@ -1,0 +1,819 @@
+CREATE OR REPLACE PROCEDURE SNOWPARK_INGESTION_PIPELINE_FINAL()
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python', 'pandas')
+HANDLER = 'run_dynamic_pipeline'
+AS
+$$
+def run_dynamic_pipeline(session):
+    import os
+    import uuid
+    from snowflake.snowpark.functions import col, lit, trim
+    from snowflake.snowpark.types import StructType, StructField, StringType
+
+    database = "SNOWFLAKE_LEARNING_DB"
+    schema = "PUBLIC"
+    log_table = f"{database}.{schema}.DQ_ERROR_LOG"
+    run_id = str(uuid.uuid4())
+
+    # ===== LOGGING FUNCTION =====
+    def log(layer, table_name, status, message, source_object="", check_type="", check_column="", total_records=0, failed_records=0, pass_percentage=0):
+        try:
+            safe_message = str(message).replace("'", "''")
+            session.sql(f"""
+                INSERT INTO {log_table} 
+                    (RUN_ID, RUN_TIMESTAMP, LAYER, SOURCE_OBJECT, TABLE_NAME, CHECK_TYPE, CHECK_COLUMN,
+                     TOTAL_RECORDS, FAILED_RECORDS, PASS_PERCENTAGE, STATUS, MESSAGE)
+                VALUES 
+                    ('{run_id}', CURRENT_TIMESTAMP, '{layer}', '{source_object}', '{table_name}', 
+                     '{check_type}', '{check_column}', {total_records}, {failed_records}, 
+                     {pass_percentage}, '{status}', '{safe_message}')
+            """).collect()
+            print(f"[{layer}] {table_name}: {status} - {message}")
+        except Exception as e:
+            print(f"Logging failed for {table_name} in layer {layer}: {e}")
+
+    # ===== DATA QUALITY CHECK FUNCTIONS =====
+    def check_duplicates(bronze_df, source_object, bronze_table, primary_keys):
+        duplicate_count = 0 
+        try:
+            if not primary_keys:
+                log(
+                "DQ_CHECK", bronze_table, "INFO",
+                "No primary key columns provided for duplicate check",
+                source_object=source_object
+            )
+            return True
+
+            total_count = bronze_df.count()
+            distinct_count = bronze_df.select(*primary_keys).distinct().count()
+            duplicate_count = total_count - distinct_count
+            pass_pct = round((distinct_count / total_count * 100), 2) if total_count > 0 else 0
+
+            status = "PASS" if duplicate_count == 0 else "FAIL"
+            details = f"Checked primary key columns: {', '.join(primary_keys)} | Found {duplicate_count} duplicate rows"
+
+            log(
+                "DQ_CHECK", bronze_table, status, details, source_object=source_object, check_type="DUPLICATE_CHECK", check_column=", ".join(primary_keys),
+                total_records=total_count, failed_records=duplicate_count, pass_percentage=pass_pct,
+            )
+
+            return duplicate_count == 0
+        except Exception as e:
+            log(
+                "DQ_CHECK", bronze_table, "ERROR", f"Duplicate check failed: {e}", source_object=source_object, check_type="DUPLICATE_CHECK",
+            )
+            return False
+
+
+    def check_nulls(bronze_df, primary_keys, source_object, bronze_table):
+        try:
+            df_columns_upper = {c.upper(): c for c in bronze_df.columns}
+            primary_keys_upper = [pk.upper() for pk in primary_keys]
+            if not primary_keys_upper:
+                log("DQ_CHECK", bronze_table, "INFO", "No primary keys defined, skipping null check", source_object=source_object)
+                return True
+
+            total_count = bronze_df.count()
+            all_passed = True
+
+            for key in primary_keys_upper:
+                actual_col = df_columns_upper.get(key)
+                if not actual_col:
+                    log("DQ_CHECK", bronze_table, "WARNING", f"Primary key '{key}' not found in table columns. Available columns: {', '.join(bronze_df.columns)}", source_object=source_object)
+                    continue
+                null_count = bronze_df.filter(col(actual_col).isNull()).count()
+                pass_pct = round(((total_count - null_count) / total_count * 100), 2) if total_count > 0 else 0
+                status = "PASS" if null_count == 0 else "FAIL"
+                details = f"Found {null_count} NULL values in primary key column"
+                log("DQ_CHECK", bronze_table, status, f"{key}: {details}", source_object=source_object, check_type="NULL_CHECK",
+                    check_column=key, total_records=total_count, failed_records=null_count, pass_percentage=pass_pct)
+                if null_count > 0:
+                    all_passed = False
+
+            return all_passed
+        except Exception as e:
+            log("DQ_CHECK", bronze_table, "ERROR", f"Null check failed: {e}", source_object=source_object, check_type="NULL_CHECK")
+            return False
+
+    def check_column_data_quality(bronze_df, source_object, bronze_table):
+        try:
+            total_count = bronze_df.count()
+            for field in bronze_df.schema.fields:
+                col_name = field.name
+                data_type = str(field.datatype).upper()
+
+                if "DATE" in data_type:
+                    invalid_count = session.sql(f"""
+                        SELECT COUNT(*) AS invalid_count
+                        FROM {bronze_table} 
+                        WHERE "{col_name}" IS NOT NULL AND TRY_TO_DATE("{col_name}") IS NULL
+                    """).collect()[0]["INVALID_COUNT"]
+                    pass_pct = round(((total_count - invalid_count) / total_count * 100), 2) if total_count > 0 else 0
+                    status = "PASS" if invalid_count == 0 else "FAIL"
+                    log("DQ_CHECK", bronze_table, status, f"{col_name}: Invalid date format in {invalid_count} records",
+                        source_object=source_object, check_type="DATE_FORMAT_CHECK", check_column=col_name,
+                        total_records=total_count, failed_records=invalid_count, pass_percentage=pass_pct)
+
+                elif "NUMBER" in data_type or "INT" in data_type or "DECIMAL" in data_type or "FLOAT" in data_type:
+                    invalid_count = session.sql(f"""
+                        SELECT COUNT(*) AS invalid_count
+                        FROM {bronze_table} 
+                        WHERE "{col_name}" IS NOT NULL AND TRY_TO_NUMBER("{col_name}") IS NULL
+                    """).collect()[0]["INVALID_COUNT"]
+                    pass_pct = round(((total_count - invalid_count) / total_count * 100), 2) if total_count > 0 else 0
+                    status = "PASS" if invalid_count == 0 else "FAIL"
+                    log("DQ_CHECK", bronze_table, status, f"{col_name}: Non-numeric values found in {invalid_count} records",
+                        source_object=source_object, check_type="NUMERIC_FORMAT_CHECK", check_column=col_name,
+                        total_records=total_count, failed_records=invalid_count, pass_percentage=pass_pct)
+
+                elif "STRING" in data_type or "VARCHAR" in data_type:
+                    empty_count = session.sql(f"""
+                        SELECT COUNT(*) AS empty_count
+                        FROM {bronze_table} 
+                        WHERE "{col_name}" IS NOT NULL AND TRIM("{col_name}") = ''
+                    """).collect()[0]["EMPTY_COUNT"]
+                    pass_pct = round(((total_count - empty_count) / total_count * 100), 2) if total_count > 0 else 0
+                    status = "PASS" if empty_count == 0 else "WARNING"
+                    log("DQ_CHECK", bronze_table, status, f"{col_name}: Empty strings found in {empty_count} records",
+                        source_object=source_object, check_type="STRING_EMPTY_CHECK", check_column=col_name,
+                        total_records=total_count, failed_records=empty_count, pass_percentage=pass_pct)
+            return True
+        except Exception as e:
+            log("DQ_CHECK", bronze_table, "ERROR", f"Column-level DQ check failed: {e}", source_object=source_object, check_type="COLUMN_DQ_CHECK")
+            return False
+
+
+    def check_email_format(bronze_df, source_object, bronze_table):
+        try:
+            if "EMAIL" not in [field.name.upper() for field in bronze_df.schema.fields]:
+                return True
+
+            total_count = bronze_df.count()
+            invalid_email_sql = f"""
+                SELECT COUNT(*) as invalid_count 
+                FROM {bronze_table} 
+                WHERE "EMAIL" IS NOT NULL 
+                AND ("EMAIL" NOT LIKE '%@%' OR "EMAIL" NOT LIKE '%.%'
+                OR LENGTH("EMAIL") > 100)
+            """
+            invalid_count = session.sql(invalid_email_sql).collect()[0]["INVALID_COUNT"]
+
+            pass_pct = (
+                round(((total_count - invalid_count) / total_count * 100), 2)
+                if total_count > 0
+                else 0
+            )
+            status = "PASS" if invalid_count == 0 else "FAIL"
+            details = f"Invalid or truncated email format in {invalid_count} records"
+
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                status,
+                f"EMAIL: {details}",
+                source_object=source_object,
+                check_type="EMAIL_FORMAT_CHECK",
+                check_column="EMAIL",
+                total_records=total_count,
+                failed_records=invalid_count,
+                pass_percentage=pass_pct,
+            )
+            return invalid_count == 0
+        except Exception as e:
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                "ERROR",
+                f"Email format check failed: {e}",
+                source_object=source_object,
+                check_type="EMAIL_FORMAT_CHECK",
+            )
+            return False
+
+    def check_phone_format(bronze_df, source_object, bronze_table):
+        try:
+            if "PHONE_NUMBER" not in [
+                field.name.upper() for field in bronze_df.schema.fields
+            ]:
+                return True
+
+            total_count = bronze_df.count()
+            invalid_phone_sql = f"""
+                SELECT COUNT(*) as invalid_count 
+                FROM {bronze_table} 
+                WHERE "PHONE_NUMBER" IS NOT NULL 
+                AND LENGTH(REGEXP_REPLACE("PHONE_NUMBER", '[^0-9]', '')) != 10
+            """
+            invalid_count = session.sql(invalid_phone_sql).collect()[0]["INVALID_COUNT"]
+
+            pass_pct = (
+                round(((total_count - invalid_count) / total_count * 100), 2)
+                if total_count > 0
+                else 0
+            )
+            status = "PASS" if invalid_count == 0 else "FAIL"
+            details = f"Invalid phone number format in {invalid_count} records (expected 10 digits)"
+
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                status,
+                f"PHONE_NUMBER: {details}",
+                source_object=source_object,
+                check_type="PHONE_FORMAT_CHECK",
+                check_column="PHONE_NUMBER",
+                total_records=total_count,
+                failed_records=invalid_count,
+                pass_percentage=pass_pct,
+            )
+            return invalid_count == 0
+        except Exception as e:
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                "ERROR",
+                f"Phone format check failed: {e}",
+                source_object=source_object,
+                check_type="PHONE_FORMAT_CHECK",
+            )
+            return False
+
+    def check_special_characters(bronze_df, source_object, bronze_table):
+        try:
+            if "EMPLOYEE_NAME" not in [
+                field.name.upper() for field in bronze_df.schema.fields
+            ]:
+                return True
+
+            total_count = bronze_df.count()
+            invalid_name_sql = f"""
+                SELECT COUNT(*) as invalid_count 
+                FROM {bronze_table} 
+                WHERE "EMPLOYEE_NAME" IS NOT NULL 
+                AND "EMPLOYEE_NAME" REGEXP '[^A-Za-z\\s\\-\\'']'
+            """
+            invalid_count = session.sql(invalid_name_sql).collect()[0]["INVALID_COUNT"]
+
+            pass_pct = (
+                round(((total_count - invalid_count) / total_count * 100), 2)
+                if total_count > 0
+                else 0
+            )
+            status = "PASS" if invalid_count == 0 else "FAIL"
+            details = f"Invalid special characters in {invalid_count} employee names"
+
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                status,
+                f"EMPLOYEE_NAME: {details}",
+                source_object=source_object,
+                check_type="SPECIAL_CHAR_CHECK",
+                check_column="EMPLOYEE_NAME",
+                total_records=total_count,
+                failed_records=invalid_count,
+                pass_percentage=pass_pct,
+            )
+            return invalid_count == 0
+        except Exception as e:
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                "ERROR",
+                f"Special character check failed: {e}",
+                source_object=source_object,
+                check_type="SPECIAL_CHAR_CHECK",
+            )
+            return False
+
+    def check_negative_values(bronze_df, source_object, bronze_table):
+        try:
+            if "SALARY" not in [
+                field.name.upper() for field in bronze_df.schema.fields
+            ]:
+                return True
+
+            total_count = bronze_df.count()
+            negative_salary_sql = f"""
+                SELECT COUNT(*) as invalid_count 
+                FROM {bronze_table} 
+                WHERE TRY_TO_NUMBER("SALARY") < 0
+            """
+            invalid_count = session.sql(negative_salary_sql).collect()[0][
+                "INVALID_COUNT"
+            ]
+
+            pass_pct = (
+                round(((total_count - invalid_count) / total_count * 100), 2)
+                if total_count > 0
+                else 0
+            )
+            status = "PASS" if invalid_count == 0 else "FAIL"
+            details = f"Negative salary values found in {invalid_count} records"
+
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                status,
+                f"SALARY: {details}",
+                source_object=source_object,
+                check_type="NEGATIVE_VALUE_CHECK",
+                check_column="SALARY",
+                total_records=total_count,
+                failed_records=invalid_count,
+                pass_percentage=pass_pct,
+            )
+            return invalid_count == 0
+        except Exception as e:
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                "ERROR",
+                f"Negative value check failed: {e}",
+                source_object=source_object,
+                check_type="NEGATIVE_VALUE_CHECK",
+            )
+            return False
+
+    def check_date_logic(bronze_df, source_object, bronze_table):
+        try:
+            has_dob = "DOB" in [field.name.upper() for field in bronze_df.schema.fields]
+            has_doj = "DOJ" in [field.name.upper() for field in bronze_df.schema.fields]
+
+            if not (has_dob and has_doj):
+                return True
+
+            total_count = bronze_df.count()
+
+            doj_before_dob_sql = f"""
+                SELECT COUNT(*) as invalid_count 
+                FROM {bronze_table} 
+                WHERE TRY_TO_DATE("DOJ") < TRY_TO_DATE("DOB")
+                AND "DOJ" IS NOT NULL AND "DOB" IS NOT NULL
+            """
+            invalid_count = session.sql(doj_before_dob_sql).collect()[0][
+                "INVALID_COUNT"
+            ]
+            pass_pct = (
+                round(((total_count - invalid_count) / total_count * 100), 2)
+                if total_count > 0
+                else 0
+            )
+            status = "PASS" if invalid_count == 0 else "FAIL"
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                status,
+                f"DOJ before DOB in {invalid_count} records",
+                source_object=source_object,
+                check_type="DATE_LOGIC_CHECK",
+                check_column="DOJ,DOB",
+                total_records=total_count,
+                failed_records=invalid_count,
+                pass_percentage=pass_pct,
+            )
+
+            future_doj_sql = f"""
+                SELECT COUNT(*) as invalid_count 
+                FROM {bronze_table} 
+                WHERE TRY_TO_DATE("DOJ") > CURRENT_DATE
+                AND "DOJ" IS NOT NULL
+            """
+            invalid_count = session.sql(future_doj_sql).collect()[0]["INVALID_COUNT"]
+            pass_pct = (
+                round(((total_count - invalid_count) / total_count * 100), 2)
+                if total_count > 0
+                else 0
+            )
+            status = "PASS" if invalid_count == 0 else "FAIL"
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                status,
+                f"Future DOJ in {invalid_count} records",
+                source_object=source_object,
+                check_type="FUTURE_DATE_CHECK",
+                check_column="DOJ",
+                total_records=total_count,
+                failed_records=invalid_count,
+                pass_percentage=pass_pct,
+            )
+
+            return True
+        except Exception as e:
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                "ERROR",
+                f"Date logic check failed: {e}",
+                source_object=source_object,
+                check_type="DATE_LOGIC_CHECK",
+            )
+            return False
+
+    # ===== PIPELINE EXECUTION =====
+    try:
+        configs = (
+            session.table(f"{database}.{schema}.CONFIGURATION_MASTER")
+            .filter("ACTIVE_FLAG = TRUE")
+            .collect()
+        )
+        if not configs:
+            log(
+                "SYSTEM",
+                "CONFIGURATION_MASTER",
+                "WARNING",
+                "No active configurations found",
+            )
+            return "No active configurations found."
+
+        log(
+            "SYSTEM",
+            "CONFIGURATION_MASTER",
+            "SUCCESS",
+            f"Found {len(configs)} active configuration(s)",
+        )
+    except Exception as e:
+        log(
+            "SYSTEM",
+            "CONFIGURATION_MASTER",
+            "FAILURE",
+            f"Failed to fetch configurations: {e}",
+        )
+        return f"Failed to fetch configurations: {e}"
+
+    for cfg in configs:
+        source_object = cfg["SOURCE_OBJECT_NAME"]
+        bronze_table = f"{database}.{schema}.{cfg['BRONZE_TABLE']}"
+        silver_table = f"{database}.{schema}.{cfg['SILVER_TABLE']}"
+        gold_table = f"{database}.{schema}.{cfg['UNIFIED_TABLE']}"
+        stage_path = cfg["LANDING_PATH"]
+        header_flag = cfg["HEADER"] if cfg["HEADER"] is not None else True
+        delimiter = cfg["DELIMITER"] if cfg["DELIMITER"] is not None else ","
+
+        # Handle PRIMARY_KEY - safely access with try-except
+        try:
+            primary_key_str = cfg["PRIMARY_KEY"] if cfg["PRIMARY_KEY"] else ""
+        except (KeyError, AttributeError):
+            primary_key_str = ""
+
+        primary_keys = (
+            [key.strip() for key in primary_key_str.split(",")]
+            if primary_key_str
+            else []
+        )
+
+        log("SYSTEM", source_object, "INFO", f"Starting pipeline for {source_object}")
+        print(f"\n{'='*60}")
+        print(f"Processing: {source_object}")
+        print(f"Bronze: {bronze_table}")
+        print(f"Silver: {silver_table}")
+        print(f"Gold: {gold_table}")
+        print(f"Primary Keys: {primary_keys}")
+        print(f"{'='*60}\n")
+
+        # ===== BRONZE LAYER =====
+        try:
+            file_name = os.path.basename(stage_path)
+            log(
+                "BRONZE",
+                bronze_table,
+                "INFO",
+                f"Reading file: @MY_S3_STAGE/{file_name}",
+                source_object=source_object,
+            )
+
+            # Enhanced CSV reading with multiple options to handle various formats
+            #bronze_df = (
+            #    session.read
+            #    .option("INFER_SCHEMA", True) 
+            #    .option("SKIP_HEADER", 1 if header_flag else 0)
+            #    .option("FIELD_DELIMITER", delimiter)
+            #    .option("SKIP_BLANK_LINES", True)
+            #    .option("TRIM_SPACE", True)
+            #    .option("ERROR_ON_COLUMN_COUNT_MISMATCH", False)
+            #    .option("FIELD_OPTIONALLY_ENCLOSED_BY", '"')
+            #    .option("ESCAPE", "\\")
+            #    .option("ESCAPE_UNENCLOSED_FIELD", "\\")
+            #    .option("ENCODING", "UTF8")
+            #    .option("PARSE_HEADER", True)
+            #
+            bronze_df = (session.read.option("header", True) \
+                        .option("delimiter", ",") \
+                        .option("quote", '"') \
+                        .csv(f"@MY_S3_STAGE/{file_name}")   
+            )
+            
+            log(
+                "BRONZE",
+                bronze_table,
+                "INFO",
+                f"Columns detected after ingestion: {bronze_df.columns}",
+                source_object=source_object
+            )
+            
+            # Check if columns are properly parsed
+            if len(bronze_df.columns) == 1 and bronze_df.columns[0].startswith('C'):
+                log(
+                    "BRONZE",
+                    bronze_table,
+                    "WARNING",
+                    f"CSV appears to be parsed as single column. This may indicate delimiter issues. Expected delimiter: '{delimiter}'",
+                    source_object=source_object,
+                )
+            
+            row_count = bronze_df.count()
+            log(
+                "BRONZE",
+                bronze_table,
+                "INFO",
+                f"Read {row_count} rows from stage",
+                source_object=source_object,
+                total_records=row_count,
+            )
+
+            bronze_df.write.mode("overwrite").save_as_table(bronze_table)
+
+            verify_count = session.table(bronze_table).count()
+            log(
+                "BRONZE",
+                bronze_table,
+                "SUCCESS",
+                f"Bronze table created with {verify_count} rows",
+                source_object=source_object,
+                total_records=verify_count,
+            )
+
+        except Exception as e:
+            error_msg = str(e)
+            log(
+                "BRONZE",
+                bronze_table,
+                "FAILURE",
+                f"Failed to create Bronze table: {error_msg}",
+                source_object=source_object,
+            )
+            print(f"Bronze Error Details: {error_msg}")
+            continue
+
+        # ===== PRE-SILVER DATA QUALITY CHECKS =====
+        log(
+            "DQ_CHECK",
+            bronze_table,
+            "INFO",
+            "Starting Data Quality checks before Silver ingestion",
+            source_object=source_object,
+        )
+
+        try:
+            bronze_read_df = session.table(bronze_table)
+
+            dup_check_passed = check_duplicates(
+                bronze_read_df, source_object, bronze_table, primary_keys
+            )
+            null_check_passed = check_nulls(
+                bronze_read_df, primary_keys, source_object, bronze_table
+            )
+            col_dq_passed = check_column_data_quality(
+                bronze_read_df, source_object, bronze_table
+            )
+            email_check_passed = check_email_format(
+                bronze_read_df, source_object, bronze_table
+            )
+            phone_check_passed = check_phone_format(
+                bronze_read_df, source_object, bronze_table
+            )
+            special_char_passed = check_special_characters(
+                bronze_read_df, source_object, bronze_table
+            )
+            negative_val_passed = check_negative_values(
+                bronze_read_df, source_object, bronze_table
+            )
+            date_logic_passed = check_date_logic(
+                bronze_read_df, source_object, bronze_table
+            )
+
+            # Log total row count
+            total_rows = bronze_read_df.count()
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                "INFO",
+                f"Total rows in table: {total_rows}",
+                source_object=source_object,
+                total_records=total_rows,
+            )
+
+            # Determine if we should proceed to Silver
+            critical_checks = [dup_check_passed, null_check_passed]
+            warning_checks = [
+                email_check_passed,
+                phone_check_passed,
+                special_char_passed,
+                negative_val_passed,
+                date_logic_passed,
+                col_dq_passed,
+            ]
+
+            all_critical_checks_passed = all(critical_checks)
+            all_warning_checks_passed = all(warning_checks)
+
+            if not all_critical_checks_passed:
+                log(
+                    "DQ_CHECK",
+                    bronze_table,
+                    "FAILURE",
+                    "Critical DQ checks failed. Skipping Silver ingestion. Review DQ_ERROR_LOG table for details.",
+                    source_object=source_object,
+                    check_type="CRITICAL_DQ_FAILURE",
+                )
+                continue
+            elif not all_warning_checks_passed:
+                log(
+                    "DQ_CHECK",
+                    bronze_table,
+                    "WARNING",
+                    "Some business rule DQ checks failed but proceeding with Silver ingestion. Review DQ_ERROR_LOG table.",
+                    source_object=source_object,
+                    check_type="BUSINESS_RULE_WARNING",
+                )
+            else:
+                log(
+                    "DQ_CHECK",
+                    bronze_table,
+                    "SUCCESS",
+                    "All DQ checks passed",
+                    source_object=source_object,
+                    check_type="ALL_DQ_PASSED",
+                )
+
+        except Exception as e:
+            log(
+                "DQ_CHECK",
+                bronze_table,
+                "ERROR",
+                f"DQ check process failed: {e}",
+                source_object=source_object,
+                check_type="DQ_CHECK_ERROR",
+            )
+            continue
+
+        # ===== SILVER LAYER =====
+        try:
+            log(
+                "SILVER",
+                silver_table,
+                "INFO",
+                "Starting Silver transformation",
+                source_object=source_object,
+            )
+
+            bronze_read_df = session.table(bronze_table)
+            bronze_count = bronze_read_df.count()
+            log(
+                "SILVER",
+                silver_table,
+                "INFO",
+                f"Reading {bronze_count} rows from Bronze table",
+                source_object=source_object,
+                total_records=bronze_count,
+            )
+
+            columns = bronze_read_df.columns
+            log(
+                "SILVER",
+                silver_table,
+                "INFO",
+                f"Processing {len(columns)} columns: {', '.join(columns)}",
+                source_object=source_object,
+            )
+
+            select_cols = []
+            for field in bronze_read_df.schema.fields:
+                col_name = field.name
+                data_type = str(field.datatype).upper()
+
+                if "STRING" in data_type or "VARCHAR" in data_type:
+                    col_expr = f'TRIM("{col_name}") AS "{col_name}"'
+                elif (
+                    "NUMBER" in data_type
+                    or "INT" in data_type
+                    or "DECIMAL" in data_type
+                    or "FLOAT" in data_type
+                ):
+                    col_expr = f'TRY_TO_NUMBER("{col_name}") AS "{col_name}"'
+                elif "DATE" in data_type:
+                    col_expr = f'TRY_TO_DATE("{col_name}") AS "{col_name}"'
+                elif "TIMESTAMP" in data_type:
+                    col_expr = f'TRY_TO_TIMESTAMP("{col_name}") AS "{col_name}"'
+                else:
+                    col_expr = f'"{col_name}"'
+
+                select_cols.append(col_expr)
+
+            silver_sql = f"SELECT {', '.join(select_cols)} FROM {bronze_table}"
+            log(
+                "SILVER",
+                silver_table,
+                "INFO",
+                f"Transformation SQL: {silver_sql[:200]}...",
+                source_object=source_object,
+            )
+
+            silver_df = session.sql(silver_sql)
+            silver_df.write.mode("overwrite").save_as_table(silver_table)
+
+            verify_silver = session.table(silver_table).count()
+            log(
+                "SILVER",
+                silver_table,
+                "SUCCESS",
+                f"Silver table created with {verify_silver} rows",
+                source_object=source_object,
+                total_records=verify_silver,
+            )
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Silver Error Details: {error_msg}")
+            log(
+                "SILVER",
+                silver_table,
+                "FAILURE",
+                f"Failed to create Silver table: {error_msg}",
+                source_object=source_object,
+            )
+            continue
+
+        # ===== GOLD / UNIFIED LAYER =====
+        try:
+            log(
+                "GOLD",
+                gold_table,
+                "INFO",
+                "Starting Gold transformation",
+                source_object=source_object,
+            )
+
+            silver_df = session.table(silver_table)
+            silver_count = silver_df.count()
+            log(
+                "GOLD",
+                gold_table,
+                "INFO",
+                f"Reading {silver_count} rows from Silver table",
+                source_object=source_object,
+                total_records=silver_count,
+            )
+
+            columns = silver_df.columns
+            log(
+                "GOLD",
+                gold_table,
+                "INFO",
+                f"Processing {len(columns)} columns: {', '.join(columns)}",
+                source_object=source_object,
+            )
+
+            # For Gold, usually business logic aggregation or unification occurs
+            # For dynamic purposes, let's just select all columns as-is
+            select_cols = [f'"{col}"' for col in columns]
+            gold_sql = f"SELECT {', '.join(select_cols)} FROM {silver_table}"
+
+            log(
+                "GOLD",
+                gold_table,
+                "INFO",
+                f"Gold transformation SQL: {gold_sql[:200]}...",
+                source_object=source_object,
+            )
+
+            gold_df = session.sql(gold_sql)
+            gold_df.write.mode("overwrite").save_as_table(gold_table)
+
+            gold_count = session.table(gold_table).count()
+            log(
+                "GOLD",
+                gold_table,
+                "SUCCESS",
+                f"Gold table created with {gold_count} rows",
+                source_object=source_object,
+                total_records=gold_count,
+            )
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Gold Error Details: {error_msg}")
+            log(
+                "GOLD",
+                gold_table,
+                "FAILURE",
+                f"Failed to create Gold table: {error_msg}",
+                source_object=source_object,
+            )
+
+    return f"Pipeline execution completed for RUN_ID: {run_id}"
+
+$$
