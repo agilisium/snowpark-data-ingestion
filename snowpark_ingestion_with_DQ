@@ -1,0 +1,563 @@
+CREATE OR REPLACE PROCEDURE SNOWPARK_INGESTION_PIPELINE_FINAL()
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python', 'pandas')
+HANDLER = 'run_dynamic_pipeline'
+AS
+$$
+def run_dynamic_pipeline(session):
+    import os
+    import uuid
+    from snowflake.snowpark.functions import col, lit, trim, current_timestamp
+    from snowflake.snowpark.types import StructType, StructField, StringType
+
+    database = "SNOWFLAKE_LEARNING_DB"
+    schema = "PUBLIC"
+    log_table = f"{database}.{schema}.DQ_ERROR_LOG"
+    quarantine_table = f"{database}.{schema}.QUARANTINE_DQ"
+    run_id = str(uuid.uuid4())
+
+    # ===== LOGGING FUNCTION =====
+    def log(layer, table_name, status, message, source_object="", check_type="", check_column="", total_records=0, failed_records=0, pass_percentage=0):
+        try:
+            safe_message = str(message).replace("'", "''")
+            session.sql(f"""
+                INSERT INTO {log_table} 
+                    (RUN_ID, RUN_TIMESTAMP, LAYER, SOURCE_OBJECT, TABLE_NAME, CHECK_TYPE, CHECK_COLUMN,
+                     TOTAL_RECORDS, FAILED_RECORDS, PASS_PERCENTAGE, STATUS, MESSAGE)
+                VALUES 
+                    ('{run_id}', CURRENT_TIMESTAMP, '{layer}', '{source_object}', '{table_name}', 
+                     '{check_type}', '{check_column}', {total_records}, {failed_records}, 
+                     {pass_percentage}, '{status}', '{safe_message}')
+            """).collect()
+            print(f"[{layer}] {table_name}: {status} - {message}")
+        except Exception as e:
+            print(f"Logging failed for {table_name} in layer {layer}: {e}")
+
+    # ===== QUARANTINE FUNCTION =====
+    def quarantine_records(bronze_table, source_object, failed_record_ids, reason, check_type):
+        """Move failed records to quarantine table"""
+        try:
+            if not failed_record_ids:
+                return
+            
+            # Get column names from bronze table
+            bronze_df_temp = session.table(bronze_table)
+            all_columns = bronze_df_temp.columns
+            
+            # Build CONCAT_WS column list for matching
+            concat_cols = ', '.join([f'COALESCE(CAST("{col}" AS VARCHAR), \'\')' for col in all_columns])
+            
+            # Escape single quotes in reason and check_type
+            safe_reason = str(reason).replace("'", "''")
+            safe_check_type = str(check_type).replace("'", "''")
+            
+            # Insert failed records into quarantine with your table structure
+            # Process in batches to avoid SQL length limits
+            batch_size = 100
+            for i in range(0, len(failed_record_ids), batch_size):
+                batch_ids = failed_record_ids[i:i + batch_size]
+                id_list = "', '".join([str(id_val).replace("'", "''") for id_val in batch_ids])
+                
+                session.sql(f"""
+                    INSERT INTO {quarantine_table} 
+                        (QUARANTINE_TIMESTAMP, SOURCE_OBJECT, DQ_FAILURE_REASON, CREATED_BY, CREATED_DATE)
+                    SELECT DISTINCT
+                        CURRENT_TIMESTAMP() as QUARANTINE_TIMESTAMP,
+                        '{source_object}' as SOURCE_OBJECT,
+                        '{safe_reason} (Check Type: {safe_check_type})' as DQ_FAILURE_REASON,
+                        'SNOWPARK_PIPELINE' as CREATED_BY,
+                        CURRENT_TIMESTAMP() as CREATED_DATE
+                    FROM {bronze_table}
+                    WHERE CONCAT_WS('|', {concat_cols}) IN ('{id_list}')
+                """).collect()
+            
+            quarantined_count = len(set(failed_record_ids))
+            log("QUARANTINE", quarantine_table, "SUCCESS", 
+                f"Quarantined {quarantined_count} records for {check_type}",
+                source_object=source_object, check_type=check_type,
+                failed_records=quarantined_count)
+                
+        except Exception as e:
+            log("QUARANTINE", quarantine_table, "ERROR", 
+                f"Failed to quarantine records: {e}",
+                source_object=source_object, check_type=check_type)
+
+    # ===== DATA QUALITY CHECK FUNCTIONS WITH QUARANTINE =====
+    def check_duplicates(bronze_df, source_object, bronze_table, primary_keys):
+        """Check for duplicates and return list of duplicate record identifiers"""
+        duplicate_ids = []
+        try:
+            if not primary_keys:
+                log("DQ_CHECK", bronze_table, "INFO",
+                    "No primary key columns provided for duplicate check",
+                    source_object=source_object)
+                return True, duplicate_ids
+
+            total_count = bronze_df.count()
+            
+            # Get all column names for CONCAT_WS
+            all_columns = bronze_df.columns
+            concat_cols = ', '.join([f'COALESCE(CAST("{col}" AS VARCHAR), \'\')' for col in all_columns])
+            
+            # Find duplicate records
+            #key_cols = [f'"{pk}"' for pk in primary_keys]
+            def clean_col(col):
+                return col.strip().replace('"', '').replace("'", '').upper()
+            key_cols = [clean_col(pk) for pk in primary_keys]
+            all_cols = [clean_col(c) for c in bronze_df.columns]
+            join_condition = " AND ".join([f"b.{k}=d.{k}" for k in key_cols])
+            concat_cols_b = ", ".join([f"b.{clean_col(col)}" for col in bronze_df.columns])
+
+            #duplicate_check_sql = f"""
+            def clean_col(col):
+                return col.strip().replace('"', '').replace("'", '').upper()
+            key_cols = [clean_col(pk) for pk in primary_keys]
+            all_cols = [clean_col(c) for c in bronze_df.columns]
+            
+            # Build join condition and concat using qualified column names
+            join_condition = " AND ".join([f'b."{k}" = d."{k}"' for k in key_cols])
+            concat_cols_qualified = ', '.join([f'COALESCE(CAST(b."{col}" AS VARCHAR), \'\')' for col in all_cols])
+
+            duplicate_check_sql = f"""
+                WITH dup_keys AS (
+                    SELECT {', '.join([f'"{k}"' for k in key_cols])}, COUNT(*) AS dup_count
+                    FROM {bronze_table}
+                    GROUP BY {', '.join([f'"{k}"' for k in key_cols])}
+                    HAVING COUNT(*) > 1
+                )
+                SELECT d.dup_count, CONCAT_WS('|', {concat_cols_qualified}) AS record_id
+                FROM {bronze_table} b
+                INNER JOIN dup_keys d
+                    ON {join_condition}
+            """
+
+            duplicate_result = session.sql(duplicate_check_sql).collect()
+            duplicate_count = sum(row['DUP_COUNT'] - 1 for row in duplicate_result)
+            
+            if duplicate_count > 0:
+                duplicate_ids = [row['RECORD_ID'] for row in duplicate_result]
+                quarantine_records(bronze_table, source_object, duplicate_ids, 
+                                 f"Duplicate records on keys: {', '.join(primary_keys)}", 
+                                 "DUPLICATE_CHECK")
+            
+            distinct_count = total_count - duplicate_count
+            pass_pct = round((distinct_count / total_count * 100), 2) if total_count > 0 else 0
+            status = "PASS" if duplicate_count == 0 else "FAIL"
+            details = f"Checked primary key columns: {', '.join(primary_keys)} | Found {duplicate_count} duplicate rows"
+
+            log("DQ_CHECK", bronze_table, status, details, 
+                source_object=source_object, check_type="DUPLICATE_CHECK", 
+                check_column=", ".join(primary_keys),
+                total_records=total_count, failed_records=duplicate_count, 
+                pass_percentage=pass_pct)
+
+            return duplicate_count == 0, duplicate_ids
+        except Exception as e:
+            log("DQ_CHECK", bronze_table, "ERROR", 
+                f"Duplicate check failed: {e}", 
+                source_object=source_object, check_type="DUPLICATE_CHECK")
+            return False, duplicate_ids
+
+    def check_nulls(bronze_df, primary_keys, source_object, bronze_table):
+        """Check for nulls in primary keys and return list of failed record identifiers"""
+        null_record_ids = []
+        try:
+            df_columns_upper = {c.upper(): c for c in bronze_df.columns}
+            primary_keys_upper = [pk.upper() for pk in primary_keys]
+            
+            if not primary_keys_upper:
+                log("DQ_CHECK", bronze_table, "INFO", 
+                    "No primary keys defined, skipping null check", 
+                    source_object=source_object)
+                return True, null_record_ids
+
+            # Get all column names for CONCAT_WS
+            all_columns = bronze_df.columns
+            concat_cols = ', '.join([f'COALESCE(CAST("{col}" AS VARCHAR), \'\')' for col in all_columns])
+
+            total_count = bronze_df.count()
+            all_passed = True
+            all_null_ids = []
+
+            for key in primary_keys_upper:
+                actual_col = df_columns_upper.get(key)
+                if not actual_col:
+                    log("DQ_CHECK", bronze_table, "WARNING", 
+                        f"Primary key '{key}' not found in table columns", 
+                        source_object=source_object)
+                    continue
+                
+                # Get records with NULL primary keys
+                null_check_sql = f"""
+                    SELECT CONCAT_WS('|', {concat_cols}) as record_id
+                    FROM {bronze_table}
+                    WHERE "{actual_col}" IS NULL
+                """
+                null_results = session.sql(null_check_sql).collect()
+                null_count = len(null_results)
+                
+                if null_count > 0:
+                    col_null_ids = [row['RECORD_ID'] for row in null_results if row['RECORD_ID']]
+                    all_null_ids.extend(col_null_ids)
+                    quarantine_records(bronze_table, source_object, col_null_ids,
+                                     f"NULL value in primary key: {key}",
+                                     "NULL_CHECK")
+                
+                pass_pct = round(((total_count - null_count) / total_count * 100), 2) if total_count > 0 else 0
+                status = "PASS" if null_count == 0 else "FAIL"
+                details = f"Found {null_count} NULL values in primary key column"
+                
+                log("DQ_CHECK", bronze_table, status, f"{key}: {details}", 
+                    source_object=source_object, check_type="NULL_CHECK",
+                    check_column=key, total_records=total_count, 
+                    failed_records=null_count, pass_percentage=pass_pct)
+                
+                if null_count > 0:
+                    all_passed = False
+
+            null_record_ids = list(set(all_null_ids))
+            return all_passed, null_record_ids
+            
+        except Exception as e:
+            log("DQ_CHECK", bronze_table, "ERROR", 
+                f"Null check failed: {e}", 
+                source_object=source_object, check_type="NULL_CHECK")
+            return False, null_record_ids
+
+    def check_email_format(bronze_df, source_object, bronze_table):
+        """Check email format and quarantine invalid records"""
+        try:
+            if "EMAIL" not in [field.name.upper() for field in bronze_df.schema.fields]:
+                return True, []
+
+            # Get all column names for CONCAT_WS
+            all_columns = bronze_df.columns
+            concat_cols = ', '.join([f'COALESCE(CAST("{col}" AS VARCHAR), \'\')' for col in all_columns])
+
+            total_count = bronze_df.count()
+            invalid_email_sql = f"""
+                SELECT CONCAT_WS('|', {concat_cols}) as record_id
+                FROM {bronze_table} 
+                WHERE "EMAIL" IS NOT NULL 
+                AND ("EMAIL" NOT LIKE '%@%' OR "EMAIL" NOT LIKE '%.%'
+                OR LENGTH("EMAIL") > 100)
+            """
+            invalid_results = session.sql(invalid_email_sql).collect()
+            invalid_count = len(invalid_results)
+            
+            invalid_ids = []
+            if invalid_count > 0:
+                invalid_ids = [row['RECORD_ID'] for row in invalid_results if row['RECORD_ID']]
+                quarantine_records(bronze_table, source_object, invalid_ids,
+                                 "Invalid email format",
+                                 "EMAIL_FORMAT_CHECK")
+
+            pass_pct = round(((total_count - invalid_count) / total_count * 100), 2) if total_count > 0 else 0
+            status = "PASS" if invalid_count == 0 else "FAIL"
+            details = f"Invalid or truncated email format in {invalid_count} records"
+
+            log("DQ_CHECK", bronze_table, status, f"EMAIL: {details}",
+                source_object=source_object, check_type="EMAIL_FORMAT_CHECK",
+                check_column="EMAIL", total_records=total_count,
+                failed_records=invalid_count, pass_percentage=pass_pct)
+                
+            return invalid_count == 0, invalid_ids
+        except Exception as e:
+            log("DQ_CHECK", bronze_table, "ERROR",
+                f"Email format check failed: {e}",
+                source_object=source_object, check_type="EMAIL_FORMAT_CHECK")
+            return False, []
+
+    def check_phone_format(bronze_df, source_object, bronze_table):
+        """Check phone format and quarantine invalid records"""
+        try:
+            if "PHONE_NUMBER" not in [field.name.upper() for field in bronze_df.schema.fields]:
+                return True, []
+
+            # Get all column names for CONCAT_WS
+            all_columns = bronze_df.columns
+            concat_cols = ', '.join([f'COALESCE(CAST("{col}" AS VARCHAR), \'\')' for col in all_columns])
+
+            total_count = bronze_df.count()
+            invalid_phone_sql = f"""
+                SELECT CONCAT_WS('|', {concat_cols}) as record_id
+                FROM {bronze_table} 
+                WHERE "PHONE_NUMBER" IS NOT NULL 
+                AND LENGTH(REGEXP_REPLACE("PHONE_NUMBER", '[^0-9]', '')) != 10
+            """
+            invalid_results = session.sql(invalid_phone_sql).collect()
+            invalid_count = len(invalid_results)
+            
+            invalid_ids = []
+            if invalid_count > 0:
+                invalid_ids = [row['RECORD_ID'] for row in invalid_results if row['RECORD_ID']]
+                quarantine_records(bronze_table, source_object, invalid_ids,
+                                 "Invalid phone number format (expected 10 digits)",
+                                 "PHONE_FORMAT_CHECK")
+
+            pass_pct = round(((total_count - invalid_count) / total_count * 100), 2) if total_count > 0 else 0
+            status = "PASS" if invalid_count == 0 else "FAIL"
+            details = f"Invalid phone number format in {invalid_count} records (expected 10 digits)"
+
+            log("DQ_CHECK", bronze_table, status, f"PHONE_NUMBER: {details}",
+                source_object=source_object, check_type="PHONE_FORMAT_CHECK",
+                check_column="PHONE_NUMBER", total_records=total_count,
+                failed_records=invalid_count, pass_percentage=pass_pct)
+                
+            return invalid_count == 0, invalid_ids
+        except Exception as e:
+            log("DQ_CHECK", bronze_table, "ERROR",
+                f"Phone format check failed: {e}",
+                source_object=source_object, check_type="PHONE_FORMAT_CHECK")
+            return False, []
+
+    def get_failed_record_filter(bronze_table, all_failed_ids):
+        """Create a WHERE clause to filter out quarantined records"""
+        if not all_failed_ids:
+            return "1=1"  # No filtering needed
+        
+        # Get all columns for CONCAT_WS
+        bronze_df_temp = session.table(bronze_table)
+        all_columns = bronze_df_temp.columns
+        concat_cols = ', '.join([f'COALESCE(CAST("{col}" AS VARCHAR), \'\')' for col in all_columns])
+        
+        # Escape single quotes in IDs
+        escaped_ids = [str(id_val).replace("'", "''") for id_val in all_failed_ids]
+        id_list = "', '".join(escaped_ids)
+        
+        return f"CONCAT_WS('|', {concat_cols}) NOT IN ('{id_list}')"
+
+    # ===== PIPELINE EXECUTION =====
+    try:
+        configs = (
+            session.table(f"{database}.{schema}.CONFIGURATION_MASTER")
+            .filter("ACTIVE_FLAG = TRUE")
+            .collect()
+        )
+        if not configs:
+            log("SYSTEM", "CONFIGURATION_MASTER", "WARNING",
+                "No active configurations found")
+            return "No active configurations found."
+
+        log("SYSTEM", "CONFIGURATION_MASTER", "SUCCESS",
+            f"Found {len(configs)} active configuration(s)")
+    except Exception as e:
+        log("SYSTEM", "CONFIGURATION_MASTER", "FAILURE",
+            f"Failed to fetch configurations: {e}")
+        return f"Failed to fetch configurations: {e}"
+
+    for cfg in configs:
+        source_object = cfg["SOURCE_OBJECT_NAME"]
+        bronze_table = f"{database}.{schema}.{cfg['BRONZE_TABLE']}"
+        silver_table = f"{database}.{schema}.{cfg['SILVER_TABLE']}"
+        gold_table = f"{database}.{schema}.{cfg['UNIFIED_TABLE']}"
+        stage_path = cfg["LANDING_PATH"]
+        header_flag = cfg["HEADER"] if cfg["HEADER"] is not None else True
+        delimiter = cfg["DELIMITER"] if cfg["DELIMITER"] is not None else ","
+
+        try:
+            primary_key_str = cfg["PRIMARY_KEY"] if cfg["PRIMARY_KEY"] else ""
+        except (KeyError, AttributeError):
+            primary_key_str = ""
+
+        primary_keys = (
+            [key.strip() for key in primary_key_str.split(",")]
+            if primary_key_str
+            else []
+        )
+
+        log("SYSTEM", source_object, "INFO", f"Starting pipeline for {source_object}")
+        print(f"\n{'='*60}")
+        print(f"Processing: {source_object}")
+        print(f"Bronze: {bronze_table}")
+        print(f"Silver: {silver_table}")
+        print(f"Gold: {gold_table}")
+        print(f"Primary Keys: {primary_keys}")
+        print(f"{'='*60}\n")
+
+        # ===== BRONZE LAYER =====
+        try:
+            file_name = os.path.basename(stage_path)
+            log("BRONZE", bronze_table, "INFO",
+                f"Reading file: @MY_S3_STAGE/{file_name}",
+                source_object=source_object)
+
+            bronze_df = (session.read.option("header", True)
+                        .option("delimiter", ",")
+                        .option("quote", '"')
+                        .csv(f"@MY_S3_STAGE/{file_name}"))
+
+            clean_cols = [c.replace('"', '').replace("'", '').strip() for c in bronze_df.columns]
+            bronze_df = bronze_df.to_df(*clean_cols)       
+     
+            log("BRONZE", bronze_table, "INFO",
+                f"Columns detected after ingestion: {bronze_df.columns}",
+                source_object=source_object)
+            
+            row_count = bronze_df.count()
+            log("BRONZE", bronze_table, "INFO",
+                f"Read {row_count} rows from stage",
+                source_object=source_object, total_records=row_count)
+
+            bronze_df.write.mode("overwrite").save_as_table(bronze_table)
+
+            verify_count = session.table(bronze_table).count()
+            log("BRONZE", bronze_table, "SUCCESS",
+                f"Bronze table created with {verify_count} rows",
+                source_object=source_object, total_records=verify_count)
+
+        except Exception as e:
+            error_msg = str(e)
+            log("BRONZE", bronze_table, "FAILURE",
+                f"Failed to create Bronze table: {error_msg}",
+                source_object=source_object)
+            print(f"Bronze Error Details: {error_msg}")
+            continue
+
+        # ===== PRE-SILVER DATA QUALITY CHECKS =====
+        log("DQ_CHECK", bronze_table, "INFO",
+            "Starting Data Quality checks before Silver ingestion",
+            source_object=source_object)
+
+        all_failed_record_ids = []
+        
+        try:
+            bronze_read_df = session.table(bronze_table)
+
+            # Run all DQ checks and collect failed record IDs
+            dup_check_passed, dup_ids = check_duplicates(
+                bronze_read_df, source_object, bronze_table, primary_keys)
+            null_check_passed, null_ids = check_nulls(
+                bronze_read_df, primary_keys, source_object, bronze_table)
+            email_check_passed, email_ids = check_email_format(
+                bronze_read_df, source_object, bronze_table)
+            phone_check_passed, phone_ids = check_phone_format(
+                bronze_read_df, source_object, bronze_table)
+
+            # Collect all failed record IDs
+            all_failed_record_ids.extend(dup_ids)
+            all_failed_record_ids.extend(null_ids)
+            all_failed_record_ids.extend(email_ids)
+            all_failed_record_ids.extend(phone_ids)
+            
+            # Remove duplicates from the list
+            all_failed_record_ids = list(set(all_failed_record_ids))
+
+            # Log total row count
+            total_rows = bronze_read_df.count()
+            quarantined_rows = len(all_failed_record_ids)
+            clean_rows = total_rows - quarantined_rows
+            
+            log("DQ_CHECK", bronze_table, "INFO",
+                f"Total rows: {total_rows} | Clean rows: {clean_rows} | Quarantined rows: {quarantined_rows}",
+                source_object=source_object, total_records=total_rows,
+                failed_records=quarantined_rows)
+
+            # Determine if we should proceed to Silver
+            critical_checks = [dup_check_passed, null_check_passed]
+            all_critical_checks_passed = all(critical_checks)
+
+            if not all_critical_checks_passed:
+                log("DQ_CHECK", bronze_table, "FAILURE",
+                    "Critical DQ checks failed. Skipping Silver ingestion. Review DQ_ERROR_LOG and QUARANTINE_DQ tables.",
+                    source_object=source_object, check_type="CRITICAL_DQ_FAILURE")
+                continue
+            else:
+                log("DQ_CHECK", bronze_table, "SUCCESS",
+                    f"DQ checks completed. Proceeding with {clean_rows} clean records to Silver.",
+                    source_object=source_object, check_type="DQ_PASSED")
+
+        except Exception as e:
+            log("DQ_CHECK", bronze_table, "ERROR",
+                f"DQ check process failed: {e}",
+                source_object=source_object, check_type="DQ_CHECK_ERROR")
+            continue
+
+        # ===== SILVER LAYER (EXCLUDING QUARANTINED RECORDS) =====
+        try:
+            log("SILVER", silver_table, "INFO",
+                "Starting Silver transformation with clean records only",
+                source_object=source_object)
+
+            bronze_read_df = session.table(bronze_table)
+            
+            # Create filter to exclude quarantined records
+            filter_clause = get_failed_record_filter(bronze_table, all_failed_record_ids)
+            
+            select_cols = []
+            for field in bronze_read_df.schema.fields:
+                col_name = field.name
+                data_type = str(field.datatype).upper()
+
+                if "STRING" in data_type or "VARCHAR" in data_type:
+                    col_expr = f'TRIM("{col_name}") AS "{col_name}"'
+                elif any(t in data_type for t in ["NUMBER", "INT", "DECIMAL", "FLOAT", "DATE", "TIMESTAMP"]):
+                    col_expr = f'"{col_name}"'
+                else:
+                    # Handle other types - consider if VARCHAR cast is appropriate
+                    col_expr = f'CAST("{col_name}" AS VARCHAR) AS "{col_name}"'
+
+                select_cols.append(col_expr)
+
+            silver_sql = f"""
+                SELECT {', '.join(select_cols)} 
+                FROM {bronze_table}
+                WHERE {filter_clause}
+            """
+            
+            log("SILVER", silver_table, "INFO",
+                f"Loading clean records to Silver (excluding {len(all_failed_record_ids)} quarantined records)",
+                source_object=source_object)
+
+            silver_df = session.sql(silver_sql)
+            silver_df.write.mode("overwrite").save_as_table(silver_table)
+
+            verify_silver = session.table(silver_table).count()
+            log("SILVER", silver_table, "SUCCESS",
+                f"Silver table created with {verify_silver} clean rows",
+                source_object=source_object, total_records=verify_silver)
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Silver Error Details: {error_msg}")
+            log("SILVER", silver_table, "FAILURE",
+                f"Failed to create Silver table: {error_msg}",
+                source_object=source_object)
+            continue
+
+        # ===== GOLD / UNIFIED LAYER =====
+        try:
+            log("GOLD", gold_table, "INFO",
+                "Starting Gold transformation",
+                source_object=source_object)
+
+            silver_df = session.table(silver_table)
+            silver_count = silver_df.count()
+            log("GOLD", gold_table, "INFO",
+                f"Reading {silver_count} rows from Silver table",
+                source_object=source_object, total_records=silver_count)
+
+            columns = silver_df.columns
+            select_cols = [f'"{col}"' for col in columns]
+            gold_sql = f"SELECT {', '.join(select_cols)} FROM {silver_table}"
+
+            gold_df = session.sql(gold_sql)
+            gold_df.write.mode("overwrite").save_as_table(gold_table)
+
+            gold_count = session.table(gold_table).count()
+            log("GOLD", gold_table, "SUCCESS",
+                f"Gold table created with {gold_count} rows",
+                source_object=source_object, total_records=gold_count)
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Gold Error Details: {error_msg}")
+            log("GOLD", gold_table, "FAILURE",
+                f"Failed to create Gold table: {error_msg}",
+                source_object=source_object)
+
+    return f"Pipeline execution completed for RUN_ID: {run_id}. Check QUARANTINE_DQ table for failed records."
+
+$$
