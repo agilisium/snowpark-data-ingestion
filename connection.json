@@ -1,0 +1,9 @@
+{
+    "account": "LZSKRQX-NY64086",
+    "user": "DEEPANRAJM",
+    "password": “XXXXXXXXX",
+    "role": "ACCOUNTADMIN",
+    "warehouse": "SNOWFLAKE_LEARNING_WH",
+    "database": "SNOWFLAKE_LEARNING_DB",
+    "schema": "PUBLIC"
+}
