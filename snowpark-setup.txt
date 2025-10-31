@@ -98,5 +98,44 @@ CREATE OR REPLACE TABLE SNOWFLAKE_LEARNING_DB.PUBLIC.QUARANTINE_DQ (
 )
 COMMENT = 'Quarantine table for records failing data quality validation checks';
 
+-------------------------------------------------------------------------------------------------------
+
+Sample Insert (CONFIGURATION_MASTER) : 
+
+INSERT INTO CONFIGURATION_MASTER (
+    source_system,
+    source_object_name,
+    bronze_table,
+    silver_table,
+    unified_table,
+    frequency,
+    landing_path,
+    archive_path,
+    file_format,
+    delimiter,
+    header,
+    primary_key,
+    active_flag,
+    updated_ts
+)
+VALUES 
+(
+    'AWS S3',                        -- source_system
+    'customer_details',               -- source_object_name
+    '`bronze_customer_details`',        -- bronze_table
+    'silver_customer_details',        -- silver_table
+    'unified_customer_details',       -- unified_table
+    'Daily',                          -- frequency
+    's3://snowparkingestion/source/', -- landing_path
+    's3://snowparkingestion/archive/',-- archive_path
+    'CSV',                             -- file_format
+    ',',                               -- delimiter
+    TRUE,                              -- header
+    'case_id',                         -- primary_key (from source file)
+    TRUE,                              -- active_flag
+    CURRENT_TIMESTAMP()                -- updated_ts
+);
+
+
 
   
